@@ -1,0 +1,75 @@
+name: Build customized x-hub portable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-portable:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check uploaded modified source archive
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'x-hub-desktop-widgets-source.zip'
+          if (-not (Test-Path -LiteralPath $archive)) {
+            throw "找不到仓库根目录下的 x-hub-desktop-widgets-source.zip。请先上传修改版源码 ZIP，再运行此工作流。"
+          }
+
+      - name: Extract modified source
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:GITHUB_WORKSPACE 'x-hub-desktop-widgets-source.zip'
+          $src = Join-Path $env:RUNNER_TEMP 'x-hub-source'
+          if (Test-Path $src) { Remove-Item $src -Recurse -Force }
+          New-Item -ItemType Directory -Path $src -Force | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $src -Force
+          if (-not (Test-Path (Join-Path $src 'package.json'))) {
+            throw "压缩包根目录没有 package.json，源代码包结构不符合预期。"
+          }
+          "SOURCE_DIR=$src" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build portable ZIP
+        shell: pwsh
+        run: |
+          Set-Location $env:SOURCE_DIR
+          pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-portable.ps1
+          if ($LASTEXITCODE -ne 0) { throw "便携版构建脚本失败，详情请查看上方日志。" }
+          $zips = Get-ChildItem (Join-Path $env:SOURCE_DIR 'dist-portable') -Filter '*win-x64-portable.zip' -File
+          if (-not $zips) { throw "构建命令结束，但未找到便携 ZIP。" }
+          $zip = $zips | Select-Object -First 1
+          $verify = Join-Path $env:RUNNER_TEMP 'portable-verify'
+          if (Test-Path $verify) { Remove-Item $verify -Recurse -Force }
+          New-Item -ItemType Directory -Path $verify -Force | Out-Null
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $verify -Force
+          if (-not (Test-Path (Join-Path $verify 'x-hub.exe'))) { throw "便携 ZIP 中缺少 x-hub.exe。" }
+          if (-not (Test-Path (Join-Path $verify 'portable'))) { throw "便携 ZIP 中缺少 portable 标记文件。" }
+          if (-not (Test-Path (Join-Path $verify 'data'))) { throw "便携 ZIP 中缺少 data 数据目录。" }
+          $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "SHA-256: $hash" | Out-File -FilePath (Join-Path $env:SOURCE_DIR 'dist-portable\SHA256.txt') -Encoding utf8
+          Write-Host "构建成功：$($zip.FullName)"
+          Write-Host "SHA-256: $hash"
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: x-hub-windows-x64-portable
+          path: |
+            ${{ runner.temp }}/x-hub-source/dist-portable/*win-x64-portable.zip
+            ${{ runner.temp }}/x-hub-source/dist-portable/SHA256.txt
+          if-no-files-found: error
+          retention-days: 14
